@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	dbm "github.com/cometbft/cometbft-db"
 	abci "github.com/cometbft/cometbft/abci/types"
@@ -273,7 +274,18 @@ func (rs *Store) loadVersion(ver int64, upgrades *types.StoreUpgrades) error {
 					return
 				}
 
+				// Track loading time for each store
+				storeLoadStart := time.Now()
+				rs.logger.Info("  Loading store...", "store", k.Name())
 				store, err := rs.loadCommitStoreFromParams(k, commitID, storeParams)
+				loadDuration := time.Since(storeLoadStart)
+
+				if err == nil {
+					rs.logger.Info("  Store loaded", "store", k.Name(), "duration", loadDuration.String())
+				} else {
+					rs.logger.Error("  Store load failed", "store", k.Name(), "duration", loadDuration.String(), "error", err)
+				}
+
 				resultChan <- loadResult{
 					key:   k,
 					store: store,
@@ -306,10 +318,17 @@ func (rs *Store) loadVersion(ver int64, upgrades *types.StoreUpgrades) error {
 				return fmt.Errorf("version of store %s mismatch root store's version; expected %d got %d; new stores should be added using StoreUpgrades", key.Name(), ver, commitID.Version)
 			}
 
+			// Track loading time for each store
+			storeLoadStart := time.Now()
+			rs.logger.Info("  Loading store (sequential)...", "store", key.Name())
 			store, err := rs.loadCommitStoreFromParams(key, commitID, storeParams)
+			loadDuration := time.Since(storeLoadStart)
+
 			if err != nil {
+				rs.logger.Error("  Store load failed", "store", key.Name(), "duration", loadDuration.String(), "error", err)
 				return errors.Wrap(err, "failed to load store")
 			}
+			rs.logger.Info("  Store loaded", "store", key.Name(), "duration", loadDuration.String())
 
 			newStores[key] = store
 

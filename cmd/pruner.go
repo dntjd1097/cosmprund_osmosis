@@ -183,6 +183,11 @@ func pruneAppState(home string) error {
 	stepStart = time.Now()
 	appStore := rootmulti.NewStore(appDB, logger)
 
+	// Disable IAVL fast node to skip expensive upgrade process
+	// Fast node is only useful for queries, not needed for pruning
+	appStore.SetIAVLDisableFastNode(true)
+	logger.Info("IAVL fast node disabled (skipping upgrade for faster loading)")
+
 	for _, value := range keys {
 		appStore.MountStoreWithDB(value, storetypes.StoreTypeIAVL, nil)
 	}
@@ -341,6 +346,16 @@ func pruneTMData(home string) error {
 		"pruneUpToHeight", pruneHeight,
 		"base", base)
 
+	// Check if there's anything to prune
+	if pruneHeight <= base {
+		logger.Info("No blocks to prune (base >= pruneHeight)",
+			"base", base,
+			"pruneHeight", pruneHeight)
+		totalDuration := time.Since(totalStartTime)
+		logger.Info("=== Tendermint Data Pruning Complete (No Action) ===", "totalDuration", totalDuration.String())
+		return nil
+	}
+
 	logger.Info("[TM 4/4] Pruning and compacting (parallel execution)...")
 	parallelStartTime := time.Now()
 
@@ -376,7 +391,7 @@ func pruneTMData(home string) error {
 	errs.Go(func() error {
 		logger.Info("  [StateStore] Starting pruning...")
 		pruneStartTime := time.Now()
-		// prune state store
+		// prune state store (only if there's something to prune)
 		err := stateStore.PruneStates(base, pruneHeight)
 		if err != nil {
 			return err
