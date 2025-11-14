@@ -3,19 +3,23 @@ package cmd
 import (
 	"os"
 
+	"github.com/cometbft/cometbft/libs/log"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
 
 var (
-	dataDir    string
-	backend    string
-	app        string
-	cosmosSdk  bool
-	tendermint bool
-	blocks     uint64
-	versions   uint64
-	appName    = "cosmprund"
+	dataDir       string
+	backend       string
+	app           string
+	cosmosSdk     bool
+	tendermint    bool
+	blocks        uint64
+	versions      uint64
+	verbose       bool
+	noCompression bool
+	appName       = "cosmprund"
+	logger        log.Logger
 )
 
 // NewRootCmd returns the root command for relayer.
@@ -27,10 +31,17 @@ func NewRootCmd() *cobra.Command {
 	}
 
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
-		// reads `homeDir/config.yaml` into `var config *Config` before each command
-		// if err := initConfig(rootCmd); err != nil {
-		// 	return err
-		// }
+		// Initialize logger with timestamp and caller info
+		logger = log.NewTMLogger(log.NewSyncWriter(os.Stdout))
+
+		// Set log level based on verbose flag
+		if verbose {
+			// Show all logs including Debug level
+			logger = log.NewFilter(logger, log.AllowDebug())
+		} else {
+			// Only show Info level and above (hides Debug logs like loadVersion commitID)
+			logger = log.NewFilter(logger, log.AllowInfo())
+		}
 
 		return nil
 	}
@@ -68,6 +79,18 @@ func NewRootCmd() *cobra.Command {
 	// --tendermint flag
 	rootCmd.PersistentFlags().BoolVar(&tendermint, "tendermint", true, "set to false you dont want to prune tendermint data(default true)")
 	if err := viper.BindPFlag("tendermint", rootCmd.PersistentFlags().Lookup("tendermint")); err != nil {
+		panic(err)
+	}
+
+	// --verbose flag
+	rootCmd.PersistentFlags().BoolVar(&verbose, "verbose", false, "enable verbose logging (shows debug logs)")
+	if err := viper.BindPFlag("verbose", rootCmd.PersistentFlags().Lookup("verbose")); err != nil {
+		panic(err)
+	}
+
+	// --no-compression flag
+	rootCmd.PersistentFlags().BoolVar(&noCompression, "no-compression", false, "disable compression (default false, compression enabled)")
+	if err := viper.BindPFlag("no-compression", rootCmd.PersistentFlags().Lookup("no-compression")); err != nil {
 		panic(err)
 	}
 
