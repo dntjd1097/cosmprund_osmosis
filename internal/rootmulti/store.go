@@ -243,52 +243,104 @@ func (rs *Store) loadVersion(ver int64, upgrades *types.StoreUpgrades) error {
 		})
 	}
 
-	for _, key := range storesKeys {
-		storeParams := rs.storesParams[key]
-		commitID := rs.getCommitID(infos, key.Name())
-		rs.logger.Debug("loading version commitID", "key", key.Name(), "version", ver, "hash", fmt.Sprintf("%x", commitID.Hash))
-
-		// If it has been added, set the initial version
-		if upgrades.IsAdded(key.Name()) || upgrades.RenamedFrom(key.Name()) != "" {
-			storeParams.initialVersion = uint64(ver) + 1
-		} else if commitID.Version != ver && storeParams.typ == types.StoreTypeIAVL {
-			return fmt.Errorf("version of store %s mismatch root store's version; expected %d got %d; new stores should be added using StoreUpgrades", key.Name(), ver, commitID.Version)
+	// Parallel loading only when no upgrades (upgrades need deterministic order)
+	if upgrades == nil || (len(upgrades.Deleted) == 0 && len(upgrades.Added) == 0 && len(upgrades.Renamed) == 0) {
+		// Parallel loading for better performance
+		type loadResult struct {
+			key   types.StoreKey
+			store types.CommitKVStore
+			err   error
 		}
 
-		store, err := rs.loadCommitStoreFromParams(key, commitID, storeParams)
-		if err != nil {
-			return errors.Wrap(err, "failed to load store")
+		resultChan := make(chan loadResult, len(storesKeys))
+		var wg sync.WaitGroup
+
+		for _, key := range storesKeys {
+			wg.Add(1)
+			go func(k types.StoreKey) {
+				defer wg.Done()
+
+				storeParams := rs.storesParams[k]
+				commitID := rs.getCommitID(infos, k.Name())
+				rs.logger.Debug("loading version commitID", "key", k.Name(), "version", ver, "hash", fmt.Sprintf("%x", commitID.Hash))
+
+				// Check version mismatch
+				if commitID.Version != ver && storeParams.typ == types.StoreTypeIAVL {
+					resultChan <- loadResult{
+						key: k,
+						err: fmt.Errorf("version of store %s mismatch root store's version; expected %d got %d; new stores should be added using StoreUpgrades", k.Name(), ver, commitID.Version),
+					}
+					return
+				}
+
+				store, err := rs.loadCommitStoreFromParams(k, commitID, storeParams)
+				resultChan <- loadResult{
+					key:   k,
+					store: store,
+					err:   err,
+				}
+			}(key)
 		}
 
-		newStores[key] = store
+		wg.Wait()
+		close(resultChan)
 
-		// If it was deleted, remove all data
-		if upgrades.IsDeleted(key.Name()) {
-			if err := deleteKVStore(types.KVStore(store)); err != nil {
-				return errors.Wrapf(err, "failed to delete store %s", key.Name())
+		// Collect results
+		for result := range resultChan {
+			if result.err != nil {
+				return errors.Wrap(result.err, "failed to load store")
 			}
-			rs.removalMap[key] = true
-		} else if oldName := upgrades.RenamedFrom(key.Name()); oldName != "" {
-			// handle renames specially
-			// make an unregistered key to satisfy loadCommitStore params
-			oldKey := types.NewKVStoreKey(oldName)
-			oldParams := newStoreParams(oldKey, storeParams.db, storeParams.typ, 0)
+			newStores[result.key] = result.store
+		}
+	} else {
+		// Sequential loading when upgrades are present (order matters)
+		for _, key := range storesKeys {
+			storeParams := rs.storesParams[key]
+			commitID := rs.getCommitID(infos, key.Name())
+			rs.logger.Debug("loading version commitID", "key", key.Name(), "version", ver, "hash", fmt.Sprintf("%x", commitID.Hash))
 
-			// load from the old name
-			oldStore, err := rs.loadCommitStoreFromParams(oldKey, rs.getCommitID(infos, oldName), oldParams)
+			// If it has been added, set the initial version
+			if upgrades.IsAdded(key.Name()) || upgrades.RenamedFrom(key.Name()) != "" {
+				storeParams.initialVersion = uint64(ver) + 1
+			} else if commitID.Version != ver && storeParams.typ == types.StoreTypeIAVL {
+				return fmt.Errorf("version of store %s mismatch root store's version; expected %d got %d; new stores should be added using StoreUpgrades", key.Name(), ver, commitID.Version)
+			}
+
+			store, err := rs.loadCommitStoreFromParams(key, commitID, storeParams)
 			if err != nil {
-				return errors.Wrapf(err, "failed to load old store %s", oldName)
+				return errors.Wrap(err, "failed to load store")
 			}
 
-			// move all data
-			if err := moveKVStoreData(types.KVStore(oldStore), types.KVStore(store)); err != nil {
-				return errors.Wrapf(err, "failed to move store %s -> %s", oldName, key.Name())
-			}
+			newStores[key] = store
 
-			// add the old key so its deletion is committed
-			newStores[oldKey] = oldStore
-			// this will ensure it's not perpetually stored in commitInfo
-			rs.removalMap[oldKey] = true
+			// If it was deleted, remove all data
+			if upgrades.IsDeleted(key.Name()) {
+				if err := deleteKVStore(types.KVStore(store)); err != nil {
+					return errors.Wrapf(err, "failed to delete store %s", key.Name())
+				}
+				rs.removalMap[key] = true
+			} else if oldName := upgrades.RenamedFrom(key.Name()); oldName != "" {
+				// handle renames specially
+				// make an unregistered key to satisfy loadCommitStore params
+				oldKey := types.NewKVStoreKey(oldName)
+				oldParams := newStoreParams(oldKey, storeParams.db, storeParams.typ, 0)
+
+				// load from the old name
+				oldStore, err := rs.loadCommitStoreFromParams(oldKey, rs.getCommitID(infos, oldName), oldParams)
+				if err != nil {
+					return errors.Wrapf(err, "failed to load old store %s", oldName)
+				}
+
+				// move all data
+				if err := moveKVStoreData(types.KVStore(oldStore), types.KVStore(store)); err != nil {
+					return errors.Wrapf(err, "failed to move store %s -> %s", oldName, key.Name())
+				}
+
+				// add the old key so its deletion is committed
+				newStores[oldKey] = oldStore
+				// this will ensure it's not perpetually stored in commitInfo
+				rs.removalMap[oldKey] = true
+			}
 		}
 	}
 
