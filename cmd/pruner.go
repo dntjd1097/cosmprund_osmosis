@@ -73,6 +73,8 @@ func pruneCmd() *cobra.Command {
 }
 
 func pruneAppState(home string) error {
+	logger.Info("=== Starting Application State Pruning ===")
+	totalStartTime := time.Now()
 
 	// this has the potential to expand size, should just use state sync
 	// dbType := db.BackendType(backend)
@@ -112,10 +114,13 @@ func pruneAppState(home string) error {
 	}
 
 	// Get BlockStore
+	logger.Info("[1/6] Opening application database...")
+	stepStart := time.Now()
 	appDB, err := db.NewGoLevelDBWithOpts("application", dbDir, &o)
 	if err != nil {
 		return err
 	}
+	logger.Info("[1/6] Database opened", "duration", time.Since(stepStart).String())
 
 	compressionType := "snappy"
 	if noCompression {
@@ -130,7 +135,8 @@ func pruneAppState(home string) error {
 		"openFiles", 2000)
 
 	//TODO: need to get all versions in the store, setting randomly is too slow
-	logger.Info("pruning application state")
+	logger.Info("[2/6] Preparing store keys...")
+	stepStart = time.Now()
 
 	// only mount keys from core sdk
 	// todo allow for other keys to be mounted
@@ -170,17 +176,25 @@ func pruneAppState(home string) error {
 		}
 	}
 
+	logger.Info("[2/6] Store keys prepared", "totalStores", len(keys), "duration", time.Since(stepStart).String())
+
 	// TODO: cleanup app state
+	logger.Info("[3/6] Creating and mounting stores...")
+	stepStart = time.Now()
 	appStore := rootmulti.NewStore(appDB, logger)
 
 	for _, value := range keys {
 		appStore.MountStoreWithDB(value, storetypes.StoreTypeIAVL, nil)
 	}
+	logger.Info("[3/6] Stores mounted", "duration", time.Since(stepStart).String())
 
+	logger.Info("[4/6] Loading latest version (reading IAVL trees from disk)...")
+	stepStart = time.Now()
 	err = appStore.LoadLatestVersion()
 	if err != nil {
 		return err
 	}
+	logger.Info("[4/6] Latest version loaded", "duration", time.Since(stepStart).String())
 
 	latestHeight := rootmulti.GetLatestVersion(appDB)
 	// valid heights should be greater than 0.
@@ -188,6 +202,8 @@ func pruneAppState(home string) error {
 		return fmt.Errorf("the database has no valid heights to prune, the latest height: %v", latestHeight)
 	}
 
+	logger.Info("[5/6] Calculating pruning heights...")
+	stepStart = time.Now()
 	var pruningHeights []int64
 	for height := int64(1); height < latestHeight; height++ {
 		if height < latestHeight-int64(versions) {
@@ -199,23 +215,43 @@ func pruneAppState(home string) error {
 
 	if len(pruningHeights) == 0 {
 		logger.Info("no heights to prune")
+		totalDuration := time.Since(totalStartTime)
+		logger.Info("=== Application State Pruning Complete (No Action) ===", "totalDuration", totalDuration.String())
 		return nil
 	}
 
+	pruneUpToHeight := pruningHeights[len(pruningHeights)-1]
+	logger.Info("[5/6] Pruning heights calculated",
+		"latestHeight", latestHeight,
+		"keepVersions", versions,
+		"pruneUpToHeight", pruneUpToHeight,
+		"totalHeightsToPrune", len(pruningHeights),
+		"duration", time.Since(stepStart).String())
+
+	logger.Info("[5/6] Pruning stores (deleting old IAVL versions)...")
+	logger.Info("⚠️  This step may take a long time depending on data size")
 	pruneStartTime := time.Now()
 	if err = appStore.PruneStores(false, pruningHeights); err != nil {
 		return err
 	}
 	pruneDuration := time.Since(pruneStartTime)
-	logger.Info("pruning application state complete", "duration", pruneDuration.String())
+	logger.Info("[5/6] Pruning stores complete", "duration", pruneDuration.String())
 
-	logger.Info("compacting application state")
-	startTime := time.Now()
+	logger.Info("[6/6] Compacting database (reclaiming disk space)...")
+	logger.Info("⚠️  This step may also take a long time")
+	compactStartTime := time.Now()
 	if err := appDB.Compact(nil, nil); err != nil {
 		return err
 	}
-	duration := time.Since(startTime)
-	logger.Info("compacting application state complete", "duration", duration.String())
+	compactDuration := time.Since(compactStartTime)
+	logger.Info("[6/6] Database compaction complete", "duration", compactDuration.String())
+
+	totalDuration := time.Since(totalStartTime)
+	logger.Info("=== Application State Pruning Complete ===",
+		"totalDuration", totalDuration.String(),
+		"loadTime", stepStart.Sub(totalStartTime).String(),
+		"pruneTime", pruneDuration.String(),
+		"compactTime", compactDuration.String())
 
 	//create a new app store
 	return nil
@@ -223,6 +259,8 @@ func pruneAppState(home string) error {
 
 // pruneTMData prunes the tendermint blocks and state based on the amount of blocks to keep
 func pruneTMData(home string) error {
+	logger.Info("=== Starting Tendermint Data Pruning ===")
+	totalStartTime := time.Now()
 
 	dbDir := rootify(dataDir, home)
 
@@ -259,17 +297,23 @@ func pruneTMData(home string) error {
 	}
 
 	// Get BlockStore
+	logger.Info("[TM 1/4] Opening blockstore database...")
+	stepStart := time.Now()
 	blockStoreDB, err := db.NewGoLevelDBWithOpts("blockstore", dbDir, &o)
 	if err != nil {
 		return err
 	}
 	blockStore := tmstore.NewBlockStore(blockStoreDB)
+	logger.Info("[TM 1/4] Blockstore opened", "duration", time.Since(stepStart).String())
 
 	// Get StateStore
+	logger.Info("[TM 2/4] Opening state database...")
+	stepStart = time.Now()
 	stateDB, err := db.NewGoLevelDBWithOpts("state", dbDir, &o)
 	if err != nil {
 		return err
 	}
+	logger.Info("[TM 2/4] State database opened", "duration", time.Since(stepStart).String())
 
 	compressionType := "snappy"
 	if noCompression {
@@ -288,14 +332,23 @@ func pruneTMData(home string) error {
 	})
 
 	base := blockStore.Base()
+	currentHeight := blockStore.Height()
+	pruneHeight := currentHeight - int64(blocks)
 
-	pruneHeight := blockStore.Height() - int64(blocks)
+	logger.Info("[TM 3/4] Calculated pruning range",
+		"currentHeight", currentHeight,
+		"keepBlocks", blocks,
+		"pruneUpToHeight", pruneHeight,
+		"base", base)
+
+	logger.Info("[TM 4/4] Pruning and compacting (parallel execution)...")
+	parallelStartTime := time.Now()
 
 	errs, _ := errgroup.WithContext(context.Background())
 
 	// Block Store pruning and compacting (goroutine 1)
 	errs.Go(func() error {
-		logger.Info("pruning block store")
+		logger.Info("  [BlockStore] Starting pruning...")
 		pruneStartTime := time.Now()
 		// prune block store
 		blocks, err = blockStore.PruneBlocks(pruneHeight)
@@ -303,22 +356,25 @@ func pruneTMData(home string) error {
 			return err
 		}
 		pruneDuration := time.Since(pruneStartTime)
-		logger.Info("pruning block store complete", "duration", pruneDuration.String())
+		logger.Info("  [BlockStore] Pruning complete", "duration", pruneDuration.String())
 
-		logger.Info("compacting block store")
-		startTime := time.Now()
+		logger.Info("  [BlockStore] Starting compaction...")
+		compactStartTime := time.Now()
 		if err := blockStoreDB.Compact(nil, nil); err != nil {
 			return err
 		}
-		duration := time.Since(startTime)
-		logger.Info("compacting block store complete", "duration", duration.String())
+		compactDuration := time.Since(compactStartTime)
+		logger.Info("  [BlockStore] Compaction complete", "duration", compactDuration.String())
+
+		totalDuration := time.Since(pruneStartTime)
+		logger.Info("  [BlockStore] Total time", "duration", totalDuration.String())
 
 		return nil
 	})
 
 	// State Store pruning and compacting (goroutine 2) - independent from blockStore
 	errs.Go(func() error {
-		logger.Info("pruning state store")
+		logger.Info("  [StateStore] Starting pruning...")
 		pruneStartTime := time.Now()
 		// prune state store
 		err := stateStore.PruneStates(base, pruneHeight)
@@ -326,21 +382,34 @@ func pruneTMData(home string) error {
 			return err
 		}
 		pruneDuration := time.Since(pruneStartTime)
-		logger.Info("pruning state store complete", "duration", pruneDuration.String())
+		logger.Info("  [StateStore] Pruning complete", "duration", pruneDuration.String())
 
-		logger.Info("compacting state store")
-		startTime := time.Now()
+		logger.Info("  [StateStore] Starting compaction...")
+		compactStartTime := time.Now()
 		if err := stateDB.Compact(nil, nil); err != nil {
 			return err
 		}
-		duration := time.Since(startTime)
-		logger.Info("compacting state store complete", "duration", duration.String())
+		compactDuration := time.Since(compactStartTime)
+		logger.Info("  [StateStore] Compaction complete", "duration", compactDuration.String())
+
+		totalDuration := time.Since(pruneStartTime)
+		logger.Info("  [StateStore] Total time", "duration", totalDuration.String())
 
 		return nil
 	})
 
 	// Wait for all goroutines to complete
-	return errs.Wait()
+	err = errs.Wait()
+	if err != nil {
+		return err
+	}
+
+	parallelDuration := time.Since(parallelStartTime)
+	totalDuration := time.Since(totalStartTime)
+	logger.Info("[TM 4/4] Parallel operations complete", "duration", parallelDuration.String())
+	logger.Info("=== Tendermint Data Pruning Complete ===", "totalDuration", totalDuration.String())
+
+	return nil
 }
 
 // Utils
