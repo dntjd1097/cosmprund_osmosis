@@ -636,26 +636,58 @@ func (rs *Store) PruneStores(clearPruningManager bool, pruningHeights []int64) (
 	pruneHeight := pruningHeights[len(pruningHeights)-1]
 	fmt.Println("deleting versions to", "pruneHeight", pruneHeight)
 
-	for key, store := range rs.stores {
-		fmt.Println("pruning store", "key", key) // Also log store.name (a private variable)?
+	// Collect pruning tasks for parallel processing
+	type pruneTask struct {
+		key   types.StoreKey
+		store types.CommitKVStore
+	}
 
+	// Collect only IAVL stores that need pruning
+	tasks := make([]pruneTask, 0, len(rs.stores))
+	for key, store := range rs.stores {
 		// If the store is wrapped with an inter-block cache, we must first unwrap
 		// it to get the underlying IAVL store.
 		if store.GetStoreType() != types.StoreTypeIAVL {
 			continue
 		}
+		tasks = append(tasks, pruneTask{
+			key:   key,
+			store: rs.GetCommitKVStore(key),
+		})
+	}
 
-		store = rs.GetCommitKVStore(key)
+	// Prune each store in parallel using goroutines
+	errChan := make(chan error, len(tasks))
+	var wg sync.WaitGroup
 
-		err := store.(*iavl.Store).DeleteVersionsTo(pruneHeight)
-		if err == nil {
-			continue
-		}
+	for _, task := range tasks {
+		wg.Add(1)
+		go func(t pruneTask) {
+			defer wg.Done()
+			fmt.Println("pruning store", "key", t.key)
 
-		if errCause := errors.Cause(err); errCause != nil && errCause != iavltree.ErrVersionDoesNotExist {
+			err := t.store.(*iavl.Store).DeleteVersionsTo(pruneHeight)
+			if err != nil {
+				if errCause := errors.Cause(err); errCause != nil && errCause != iavltree.ErrVersionDoesNotExist {
+					errChan <- fmt.Errorf("failed to prune store %s: %w", t.key.Name(), err)
+					return
+				}
+			}
+			fmt.Println("pruning store complete", "key", t.key)
+		}(task)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+	close(errChan)
+
+	// Check for errors
+	for err := range errChan {
+		if err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 

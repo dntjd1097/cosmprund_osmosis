@@ -51,23 +51,19 @@ func pruneCmd() *cobra.Command {
 
 			ctx := cmd.Context()
 			errs, _ := errgroup.WithContext(ctx)
-			var err error
+
+			// Tendermint pruning (blockstore.db, state.db)
 			if tendermint {
 				errs.Go(func() error {
-					if err = pruneTMData(args[0]); err != nil {
-						return err
-					}
-					return nil
+					return pruneTMData(args[0])
 				})
 			}
 
+			// CosmosSDK pruning (application.db)
 			if cosmosSdk {
-				err = pruneAppState(args[0])
-				if err != nil {
-					return err
-				}
-				return nil
-
+				errs.Go(func() error {
+					return pruneAppState(args[0])
+				})
 			}
 
 			return errs.Wait()
@@ -212,6 +208,8 @@ func pruneTMData(home string) error {
 	pruneHeight := blockStore.Height() - int64(blocks)
 
 	errs, _ := errgroup.WithContext(context.Background())
+
+	// Block Store pruning and compacting (goroutine 1)
 	errs.Go(func() error {
 		fmt.Println("pruning block store")
 		// prune block store
@@ -230,21 +228,27 @@ func pruneTMData(home string) error {
 		return nil
 	})
 
-	fmt.Println("pruning state store")
-	// prune state store
-	err = stateStore.PruneStates(base, pruneHeight)
-	if err != nil {
-		return err
-	}
-	fmt.Println("pruning state store complete")
+	// State Store pruning and compacting (goroutine 2) - independent from blockStore
+	errs.Go(func() error {
+		fmt.Println("pruning state store")
+		// prune state store
+		err := stateStore.PruneStates(base, pruneHeight)
+		if err != nil {
+			return err
+		}
+		fmt.Println("pruning state store complete")
 
-	fmt.Println("compacting state store")
-	if err := stateDB.Compact(nil, nil); err != nil {
-		return err
-	}
-	fmt.Println("compacting state store complete")
+		fmt.Println("compacting state store")
+		if err := stateDB.Compact(nil, nil); err != nil {
+			return err
+		}
+		fmt.Println("compacting state store complete")
 
-	return nil
+		return nil
+	})
+
+	// Wait for all goroutines to complete
+	return errs.Wait()
 }
 
 // Utils
