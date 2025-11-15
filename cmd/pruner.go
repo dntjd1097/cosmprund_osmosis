@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"runtime"
+	"syscall"
 	"time"
 
+	"github.com/cometbft/cometbft/libs/log"
 	"github.com/cosmos/cosmos-sdk/types"
 	authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
 	authzkeeper "github.com/cosmos/cosmos-sdk/x/authz/keeper"
@@ -42,12 +45,97 @@ import (
 // load app store and prune
 // if immutable tree is not deletable we should import and export current state
 
+// resourceStats holds resource usage statistics
+type resourceStats struct {
+	startTime     time.Time
+	startRusage   syscall.Rusage
+	startMemStats runtime.MemStats
+	peakMemory    uint64
+}
+
+// newResourceStats creates and initializes resource tracking
+func newResourceStats() *resourceStats {
+	rs := &resourceStats{
+		startTime: time.Now(),
+	}
+
+	// Get initial CPU/IO stats
+	syscall.Getrusage(syscall.RUSAGE_SELF, &rs.startRusage)
+
+	// Get initial memory stats
+	runtime.ReadMemStats(&rs.startMemStats)
+	rs.peakMemory = rs.startMemStats.Alloc
+
+	return rs
+}
+
+// updatePeakMemory updates peak memory usage
+func (rs *resourceStats) updatePeakMemory() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	if m.Alloc > rs.peakMemory {
+		rs.peakMemory = m.Alloc
+	}
+}
+
+// printStats prints final resource usage statistics
+func (rs *resourceStats) printStats() {
+	duration := time.Since(rs.startTime)
+
+	// Get final CPU/IO stats
+	var endRusage syscall.Rusage
+	syscall.Getrusage(syscall.RUSAGE_SELF, &endRusage)
+
+	// Get final memory stats
+	var endMemStats runtime.MemStats
+	runtime.ReadMemStats(&endMemStats)
+
+	// Calculate CPU time (user + system)
+	userCPU := float64(endRusage.Utime.Sec-rs.startRusage.Utime.Sec) +
+		float64(endRusage.Utime.Usec-rs.startRusage.Utime.Usec)/1e6
+	sysCPU := float64(endRusage.Stime.Sec-rs.startRusage.Stime.Sec) +
+		float64(endRusage.Stime.Usec-rs.startRusage.Stime.Usec)/1e6
+	totalCPU := userCPU + sysCPU
+
+	// Calculate disk I/O (blocks)
+	blocksIn := endRusage.Inblock - rs.startRusage.Inblock
+	blocksOut := endRusage.Oublock - rs.startRusage.Oublock
+
+	fmt.Println("\n=== Resource Usage ===")
+	fmt.Printf("Total time: %s\n", duration)
+	fmt.Printf("CPU time: %.2fs (user: %.2fs, system: %.2fs)\n", totalCPU, userCPU, sysCPU)
+	fmt.Printf("CPU usage: %.1f%%\n", (totalCPU/duration.Seconds())*100)
+	fmt.Printf("Peak memory: %.2f MB\n", float64(rs.peakMemory)/(1024*1024))
+	fmt.Printf("Final memory: %.2f MB\n", float64(endMemStats.Alloc)/(1024*1024))
+	fmt.Printf("Total allocated: %.2f MB\n", float64(endMemStats.TotalAlloc)/(1024*1024))
+	fmt.Printf("Disk I/O: %d blocks in, %d blocks out\n", blocksIn, blocksOut)
+	fmt.Printf("GC runs: %d\n", endMemStats.NumGC-rs.startMemStats.NumGC)
+}
+
 func pruneCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "prune [path_to_home]",
 		Short: "prune data from the application store and block store",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Initialize resource tracking
+			stats := newResourceStats()
+			fmt.Println("Starting pruning...")
+
+			// Start a goroutine to periodically update peak memory
+			done := make(chan bool)
+			go func() {
+				ticker := time.NewTicker(100 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						stats.updatePeakMemory()
+					case <-done:
+						return
+					}
+				}
+			}()
 
 			ctx := cmd.Context()
 			errs, _ := errgroup.WithContext(ctx)
@@ -66,15 +154,21 @@ func pruneCmd() *cobra.Command {
 				})
 			}
 
-			return errs.Wait()
+			err := errs.Wait()
+
+			// Stop memory monitoring
+			close(done)
+
+			// Print resource usage statistics
+			stats.printStats()
+
+			return err
 		},
 	}
 	return cmd
 }
 
 func pruneAppState(home string) error {
-	logger.Info("=== Starting Application State Pruning ===")
-	totalStartTime := time.Now()
 
 	// this has the potential to expand size, should just use state sync
 	// dbType := db.BackendType(backend)
@@ -114,29 +208,13 @@ func pruneAppState(home string) error {
 	}
 
 	// Get BlockStore
-	logger.Info("[1/6] Opening application database...")
-	stepStart := time.Now()
 	appDB, err := db.NewGoLevelDBWithOpts("application", dbDir, &o)
 	if err != nil {
 		return err
 	}
-	logger.Info("[1/6] Database opened", "duration", time.Since(stepStart).String())
-
-	compressionType := "snappy"
-	if noCompression {
-		compressionType = "disabled"
-	}
-	logger.Info("application database options configured",
-		"writeBuffer", "128MB",
-		"blockSize", "32KB",
-		"compactionTableSize", "16MB",
-		"blockCache", "64MB",
-		"compression", compressionType,
-		"openFiles", 2000)
 
 	//TODO: need to get all versions in the store, setting randomly is too slow
-	logger.Info("[2/6] Preparing store keys...")
-	stepStart = time.Now()
+	fmt.Println("pruning application state")
 
 	// only mount keys from core sdk
 	// todo allow for other keys to be mounted
@@ -176,30 +254,21 @@ func pruneAppState(home string) error {
 		}
 	}
 
-	logger.Info("[2/6] Store keys prepared", "totalStores", len(keys), "duration", time.Since(stepStart).String())
-
 	// TODO: cleanup app state
-	logger.Info("[3/6] Creating and mounting stores...")
-	stepStart = time.Now()
-	appStore := rootmulti.NewStore(appDB, logger)
+	appStore := rootmulti.NewStore(appDB, log.NewNopLogger())
 
 	// Disable IAVL fast node to skip expensive upgrade process
 	// Fast node is only useful for queries, not needed for pruning
 	appStore.SetIAVLDisableFastNode(true)
-	logger.Info("IAVL fast node disabled (skipping upgrade for faster loading)")
 
 	for _, value := range keys {
 		appStore.MountStoreWithDB(value, storetypes.StoreTypeIAVL, nil)
 	}
-	logger.Info("[3/6] Stores mounted", "duration", time.Since(stepStart).String())
 
-	logger.Info("[4/6] Loading latest version (reading IAVL trees from disk)...")
-	stepStart = time.Now()
 	err = appStore.LoadLatestVersion()
 	if err != nil {
 		return err
 	}
-	logger.Info("[4/6] Latest version loaded", "duration", time.Since(stepStart).String())
 
 	latestHeight := rootmulti.GetLatestVersion(appDB)
 	// valid heights should be greater than 0.
@@ -207,56 +276,30 @@ func pruneAppState(home string) error {
 		return fmt.Errorf("the database has no valid heights to prune, the latest height: %v", latestHeight)
 	}
 
-	logger.Info("[5/6] Calculating pruning heights...")
-	stepStart = time.Now()
-	var pruningHeights []int64
-	for height := int64(1); height < latestHeight; height++ {
-		if height < latestHeight-int64(versions) {
-			pruningHeights = append(pruningHeights, height)
-		}
-	}
-
-	//pruningHeight := []int64{latestHeight - int64(versions)}
-
-	if len(pruningHeights) == 0 {
-		logger.Info("no heights to prune")
-		totalDuration := time.Since(totalStartTime)
-		logger.Info("=== Application State Pruning Complete (No Action) ===", "totalDuration", totalDuration.String())
+	// var pruningHeights []int64
+	// for height := int64(1); height < latestHeight; height++ {
+	// 	if height < latestHeight-int64(versions) {
+	// 		pruningHeights = append(pruningHeights, height)
+	// 	}
+	// }
+	pruneHeight := latestHeight - int64(versions)
+	if pruneHeight <= 0 {
+		fmt.Println("no heights to prune")
 		return nil
 	}
+	pruningHeights := []int64{pruneHeight}
+	//pruningHeight := []int64{latestHeight - int64(versions)}
 
-	pruneUpToHeight := pruningHeights[len(pruningHeights)-1]
-	logger.Info("[5/6] Pruning heights calculated",
-		"latestHeight", latestHeight,
-		"keepVersions", versions,
-		"pruneUpToHeight", pruneUpToHeight,
-		"totalHeightsToPrune", len(pruningHeights),
-		"duration", time.Since(stepStart).String())
-
-	logger.Info("[5/6] Pruning stores (deleting old IAVL versions)...")
-	logger.Info("⚠️  This step may take a long time depending on data size")
-	pruneStartTime := time.Now()
 	if err = appStore.PruneStores(false, pruningHeights); err != nil {
 		return err
 	}
-	pruneDuration := time.Since(pruneStartTime)
-	logger.Info("[5/6] Pruning stores complete", "duration", pruneDuration.String())
+	fmt.Println("pruning application state complete")
 
-	logger.Info("[6/6] Compacting database (reclaiming disk space)...")
-	logger.Info("⚠️  This step may also take a long time")
-	compactStartTime := time.Now()
+	fmt.Println("compacting application state")
 	if err := appDB.Compact(nil, nil); err != nil {
 		return err
 	}
-	compactDuration := time.Since(compactStartTime)
-	logger.Info("[6/6] Database compaction complete", "duration", compactDuration.String())
-
-	totalDuration := time.Since(totalStartTime)
-	logger.Info("=== Application State Pruning Complete ===",
-		"totalDuration", totalDuration.String(),
-		"loadTime", stepStart.Sub(totalStartTime).String(),
-		"pruneTime", pruneDuration.String(),
-		"compactTime", compactDuration.String())
+	fmt.Println("compacting application state complete")
 
 	//create a new app store
 	return nil
@@ -264,8 +307,6 @@ func pruneAppState(home string) error {
 
 // pruneTMData prunes the tendermint blocks and state based on the amount of blocks to keep
 func pruneTMData(home string) error {
-	logger.Info("=== Starting Tendermint Data Pruning ===")
-	totalStartTime := time.Now()
 
 	dbDir := rootify(dataDir, home)
 
@@ -302,127 +343,63 @@ func pruneTMData(home string) error {
 	}
 
 	// Get BlockStore
-	logger.Info("[TM 1/4] Opening blockstore database...")
-	stepStart := time.Now()
 	blockStoreDB, err := db.NewGoLevelDBWithOpts("blockstore", dbDir, &o)
 	if err != nil {
 		return err
 	}
 	blockStore := tmstore.NewBlockStore(blockStoreDB)
-	logger.Info("[TM 1/4] Blockstore opened", "duration", time.Since(stepStart).String())
-
-	// Get StateStore
-	logger.Info("[TM 2/4] Opening state database...")
-	stepStart = time.Now()
-	stateDB, err := db.NewGoLevelDBWithOpts("state", dbDir, &o)
-	if err != nil {
-		return err
-	}
-	logger.Info("[TM 2/4] State database opened", "duration", time.Since(stepStart).String())
-
-	compressionType := "snappy"
-	if noCompression {
-		compressionType = "disabled"
-	}
-	logger.Info("tendermint database options configured",
-		"writeBuffer", "128MB",
-		"blockSize", "32KB",
-		"compactionTableSize", "16MB",
-		"blockCache", "64MB",
-		"compression", compressionType,
-		"openFiles", 2000)
-
-	stateStore := state.NewStore(stateDB, state.StoreOptions{
-		DiscardABCIResponses: true,
-	})
 
 	base := blockStore.Base()
-	currentHeight := blockStore.Height()
-	pruneHeight := currentHeight - int64(blocks)
 
-	logger.Info("[TM 3/4] Calculated pruning range",
-		"currentHeight", currentHeight,
-		"keepBlocks", blocks,
-		"pruneUpToHeight", pruneHeight,
-		"base", base)
+	pruneHeight := blockStore.Height() - int64(blocks)
 
 	// Check if there's anything to prune
 	if pruneHeight <= base {
-		logger.Info("No blocks to prune (base >= pruneHeight)",
-			"base", base,
-			"pruneHeight", pruneHeight)
-		totalDuration := time.Since(totalStartTime)
-		logger.Info("=== Tendermint Data Pruning Complete (No Action) ===", "totalDuration", totalDuration.String())
+		fmt.Printf("No blocks to prune (base: %d, target: %d)\n", base, pruneHeight)
 		return nil
 	}
 
-	logger.Info("[TM 4/4] Pruning and compacting (parallel execution)...")
-	parallelStartTime := time.Now()
-
 	errs, _ := errgroup.WithContext(context.Background())
-
-	// Block Store pruning and compacting (goroutine 1)
 	errs.Go(func() error {
-		logger.Info("  [BlockStore] Starting pruning...")
-		pruneStartTime := time.Now()
+		fmt.Println("pruning block store")
 		// prune block store
 		blocks, err = blockStore.PruneBlocks(pruneHeight)
 		if err != nil {
 			return err
 		}
-		pruneDuration := time.Since(pruneStartTime)
-		logger.Info("  [BlockStore] Pruning complete", "duration", pruneDuration.String())
+		fmt.Println("pruning block store complete")
 
-		logger.Info("  [BlockStore] Starting compaction...")
-		compactStartTime := time.Now()
+		fmt.Println("compacting block store")
 		if err := blockStoreDB.Compact(nil, nil); err != nil {
 			return err
 		}
-		compactDuration := time.Since(compactStartTime)
-		logger.Info("  [BlockStore] Compaction complete", "duration", compactDuration.String())
-
-		totalDuration := time.Since(pruneStartTime)
-		logger.Info("  [BlockStore] Total time", "duration", totalDuration.String())
+		fmt.Println("compacting block store complete")
 
 		return nil
 	})
 
-	// State Store pruning and compacting (goroutine 2) - independent from blockStore
-	errs.Go(func() error {
-		logger.Info("  [StateStore] Starting pruning...")
-		pruneStartTime := time.Now()
-		// prune state store (only if there's something to prune)
-		err := stateStore.PruneStates(base, pruneHeight)
-		if err != nil {
-			return err
-		}
-		pruneDuration := time.Since(pruneStartTime)
-		logger.Info("  [StateStore] Pruning complete", "duration", pruneDuration.String())
-
-		logger.Info("  [StateStore] Starting compaction...")
-		compactStartTime := time.Now()
-		if err := stateDB.Compact(nil, nil); err != nil {
-			return err
-		}
-		compactDuration := time.Since(compactStartTime)
-		logger.Info("  [StateStore] Compaction complete", "duration", compactDuration.String())
-
-		totalDuration := time.Since(pruneStartTime)
-		logger.Info("  [StateStore] Total time", "duration", totalDuration.String())
-
-		return nil
-	})
-
-	// Wait for all goroutines to complete
-	err = errs.Wait()
+	// Get StateStore
+	stateDB, err := db.NewGoLevelDBWithOpts("state", dbDir, &o)
 	if err != nil {
 		return err
 	}
 
-	parallelDuration := time.Since(parallelStartTime)
-	totalDuration := time.Since(totalStartTime)
-	logger.Info("[TM 4/4] Parallel operations complete", "duration", parallelDuration.String())
-	logger.Info("=== Tendermint Data Pruning Complete ===", "totalDuration", totalDuration.String())
+	stateStore := state.NewStore(stateDB, state.StoreOptions{
+		DiscardABCIResponses: true,
+	})
+	fmt.Println("pruning state store")
+	// prune state store
+	err = stateStore.PruneStates(base, pruneHeight)
+	if err != nil {
+		return err
+	}
+	fmt.Println("pruning state store complete")
+
+	fmt.Println("compacting state store")
+	if err := stateDB.Compact(nil, nil); err != nil {
+		return err
+	}
+	fmt.Println("compacting state store complete")
 
 	return nil
 }

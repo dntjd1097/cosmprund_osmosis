@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	dbm "github.com/cometbft/cometbft-db"
 	abci "github.com/cometbft/cometbft/abci/types"
@@ -210,7 +209,7 @@ func (rs *Store) LoadVersion(ver int64) error {
 func (rs *Store) loadVersion(ver int64, upgrades *types.StoreUpgrades) error {
 	infos := make(map[string]types.StoreInfo)
 
-	rs.logger.Info("loading version", "version", ver)
+	fmt.Println("loadVersion", "ver", ver)
 	cInfo := &types.CommitInfo{}
 
 	// load old data if we are not version 0
@@ -263,7 +262,7 @@ func (rs *Store) loadVersion(ver int64, upgrades *types.StoreUpgrades) error {
 
 				storeParams := rs.storesParams[k]
 				commitID := rs.getCommitID(infos, k.Name())
-				rs.logger.Debug("loading version commitID", "key", k.Name(), "version", ver, "hash", fmt.Sprintf("%x", commitID.Hash))
+				fmt.Println("loadVersion commitID", "key", k, "ver", ver, "hash", fmt.Sprintf("%x", commitID.Hash))
 
 				// Check version mismatch
 				if commitID.Version != ver && storeParams.typ == types.StoreTypeIAVL {
@@ -274,17 +273,7 @@ func (rs *Store) loadVersion(ver int64, upgrades *types.StoreUpgrades) error {
 					return
 				}
 
-				// Track loading time for each store
-				storeLoadStart := time.Now()
-				rs.logger.Info("  Loading store...", "store", k.Name())
 				store, err := rs.loadCommitStoreFromParams(k, commitID, storeParams)
-				loadDuration := time.Since(storeLoadStart)
-
-				if err == nil {
-					rs.logger.Info("  Store loaded", "store", k.Name(), "duration", loadDuration.String())
-				} else {
-					rs.logger.Error("  Store load failed", "store", k.Name(), "duration", loadDuration.String(), "error", err)
-				}
 
 				resultChan <- loadResult{
 					key:   k,
@@ -309,7 +298,7 @@ func (rs *Store) loadVersion(ver int64, upgrades *types.StoreUpgrades) error {
 		for _, key := range storesKeys {
 			storeParams := rs.storesParams[key]
 			commitID := rs.getCommitID(infos, key.Name())
-			rs.logger.Debug("loading version commitID", "key", key.Name(), "version", ver, "hash", fmt.Sprintf("%x", commitID.Hash))
+			fmt.Println("loadVersion commitID", "key", key, "ver", ver, "hash", fmt.Sprintf("%x", commitID.Hash))
 
 			// If it has been added, set the initial version
 			if upgrades.IsAdded(key.Name()) || upgrades.RenamedFrom(key.Name()) != "" {
@@ -318,17 +307,10 @@ func (rs *Store) loadVersion(ver int64, upgrades *types.StoreUpgrades) error {
 				return fmt.Errorf("version of store %s mismatch root store's version; expected %d got %d; new stores should be added using StoreUpgrades", key.Name(), ver, commitID.Version)
 			}
 
-			// Track loading time for each store
-			storeLoadStart := time.Now()
-			rs.logger.Info("  Loading store (sequential)...", "store", key.Name())
 			store, err := rs.loadCommitStoreFromParams(key, commitID, storeParams)
-			loadDuration := time.Since(storeLoadStart)
-
 			if err != nil {
-				rs.logger.Error("  Store load failed", "store", key.Name(), "duration", loadDuration.String(), "error", err)
 				return errors.Wrap(err, "failed to load store")
 			}
-			rs.logger.Info("  Store loaded", "store", key.Name(), "duration", loadDuration.String())
 
 			newStores[key] = store
 
@@ -519,7 +501,7 @@ func (rs *Store) Commit() types.CommitID {
 	}
 
 	if rs.commitHeader.Height != version {
-		rs.logger.Error("commit header and version mismatch", "header_height", rs.commitHeader.Height, "version", version)
+		fmt.Println("commit header and version mismatch", "header_height", rs.commitHeader.Height, "version", version)
 	}
 
 	rs.lastCommitInfo = commitStores(version, rs.stores, rs.removalMap)
@@ -677,8 +659,8 @@ func (rs *Store) handlePruning(version int64) error {
 	if !rs.pruningManager.ShouldPruneAtHeight(version) {
 		return nil
 	}
-	rs.logger.Info("prune start", "height", version)
-	defer rs.logger.Info("prune end", "height", version)
+	fmt.Println("prune start", "height", version)
+	defer fmt.Println("prune end", "height", version)
 	return rs.PruneStores(true, nil)
 }
 
@@ -693,19 +675,19 @@ func (rs *Store) PruneStores(clearPruningManager bool, pruningHeights []int64) (
 		}
 
 		if len(heights) == 0 {
-			rs.logger.Info("no heights to be pruned from pruning manager")
+			fmt.Println("no heights to be pruned from pruning manager")
 		}
 
 		pruningHeights = append(pruningHeights, heights...)
 	}
 
 	if len(pruningHeights) == 0 {
-		rs.logger.Info("no heights need to be pruned")
+		fmt.Println("no heights need to be pruned")
 		return nil
 	}
 
 	pruneHeight := pruningHeights[len(pruningHeights)-1]
-	rs.logger.Info("deleting versions", "pruneHeight", pruneHeight)
+	fmt.Println("deleting versions to", "pruneHeight", pruneHeight)
 
 	// Collect pruning tasks for parallel processing
 	type pruneTask struct {
@@ -735,7 +717,7 @@ func (rs *Store) PruneStores(clearPruningManager bool, pruningHeights []int64) (
 		wg.Add(1)
 		go func(t pruneTask) {
 			defer wg.Done()
-			rs.logger.Info("pruning store", "store", t.key.Name())
+			fmt.Println("pruning store", "key", t.key.Name())
 
 			err := t.store.(*iavl.Store).DeleteVersionsTo(pruneHeight)
 			if err != nil {
@@ -744,7 +726,7 @@ func (rs *Store) PruneStores(clearPruningManager bool, pruningHeights []int64) (
 					return
 				}
 			}
-			rs.logger.Info("pruning store complete", "store", t.key.Name())
+			fmt.Println("pruning store complete", "key", t.key.Name())
 		}(task)
 	}
 
@@ -907,7 +889,7 @@ func (rs *Store) Snapshot(height uint64, protoWriter protoio.Writer) error {
 	// and the following messages contain a SnapshotNode (i.e. an ExportNode). Store changes
 	// are demarcated by new SnapshotStore items.
 	for _, store := range stores {
-		rs.logger.Info("starting snapshot", "store", store.name, "height", height)
+		fmt.Println("starting snapshot", "store", store.name, "height", height)
 		exporter, err := store.Export(int64(height))
 		if err != nil {
 			rs.logger.Error("snapshot failed; exporter error", "store", store.name, "err", err)
@@ -929,7 +911,7 @@ func (rs *Store) Snapshot(height uint64, protoWriter protoio.Writer) error {
 		for {
 			node, err := exporter.Next()
 			if err == iavltree.ErrorExportDone {
-				rs.logger.Info("snapshot done", "store", store.name, "nodeCount", nodeCount)
+				fmt.Println("snapshot Done", "store", store.name, "nodeCount", nodeCount)
 				nodeCount = 0
 				break
 			} else if err != nil {
@@ -996,7 +978,7 @@ loop:
 			}
 			defer importer.Close()
 			// Importer height must reflect the node height (which usually matches the block height, but not always)
-			rs.logger.Info("restoring snapshot", "store", item.Store.Name)
+			fmt.Println("restoring snapshot", "store", item.Store.Name)
 
 		case *snapshottypes.SnapshotItem_IAVL:
 			if importer == nil {
@@ -1063,7 +1045,7 @@ func (rs *Store) loadCommitStoreFromParams(key types.StoreKey, id types.CommitID
 			// If the whitelist is not empty, enable fast nodes for only the modules in the whitelist.
 			disabledFastNodes = true
 			if _, ok := rs.iavlFastNodeModuleWhitelist[key.Name()]; ok {
-				rs.logger.Info("fast node enabled for module", "module", key.Name())
+				fmt.Println("fast node enabled for module", "module", key.Name())
 				disabledFastNodes = false
 			}
 		}
@@ -1189,14 +1171,14 @@ func (rs *Store) GetCommitInfo(ver int64) (*types.CommitInfo, error) {
 }
 
 func (rs *Store) flushMetadata(db dbm.DB, version int64, cInfo *types.CommitInfo) {
-	rs.logger.Debug("flushing metadata", "height", version)
+	fmt.Println("flushing metadata", "height", version)
 	batch := db.NewBatch()
 	defer batch.Close()
 
 	if cInfo != nil {
 		flushCommitInfo(batch, version, cInfo)
 	} else {
-		rs.logger.Error("commitInfo is nil, not flushed", "height", version)
+		fmt.Println("commitInfo is nil, not flushed", "height", version)
 	}
 
 	flushLatestVersion(batch, version)
@@ -1204,7 +1186,7 @@ func (rs *Store) flushMetadata(db dbm.DB, version int64, cInfo *types.CommitInfo
 	if err := batch.WriteSync(); err != nil {
 		panic(fmt.Errorf("error on batch write %w", err))
 	}
-	rs.logger.Debug("flushing metadata finished", "height", version)
+	fmt.Println("flushing metadata finished", "height", version)
 }
 
 type storeParams struct {
